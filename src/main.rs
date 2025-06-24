@@ -279,6 +279,48 @@ fn get_memory_usage() -> String {
     "Memory info unavailable".to_string()
 }
 
+// Extract memory in GB for consistent reporting
+fn get_memory_gb() -> String {
+    let memory_info = get_memory_usage();
+    if memory_info.contains("VmRSS:") {
+        if let Some(rss_start) = memory_info.find("VmRSS:") {
+            let rss_part = &memory_info[rss_start..];
+            if let Some(rss_end) = rss_part.find('\n') {
+                let rss_line = &rss_part[..rss_end];
+                if let Some(kb_str) = rss_line.split_whitespace().nth(1) {
+                    if let Ok(kb) = kb_str.parse::<u64>() {
+                        return format!("{:.1}GB", kb as f64 / 1_000_000.0);
+                    }
+                }
+            }
+        }
+    }
+    "?GB".to_string()
+}
+
+// Standardized progress update function
+fn update_progress_with_memory(
+    progress: &ProgressBar,
+    entity_name: &str,
+    processed_count: u64,
+    files_done: u64,
+    total_files: u64,
+) {
+    let memory_gb = get_memory_gb();
+    let count_display = if processed_count >= 1_000_000 {
+        format!("{:.1}M", processed_count as f64 / 1_000_000.0)
+    } else if processed_count >= 1_000 {
+        format!("{:.1}K", processed_count as f64 / 1_000.0)
+    } else {
+        processed_count.to_string()
+    };
+    
+    progress.set_message(format!(
+        "File {}/{} | {} {} | {} RAM",
+        files_done, total_files, count_display, entity_name, memory_gb
+    ));
+}
+
 // ====== UTILITY FUNCTIONS ======
 fn create_parquet_writer(output_path: &Path, schema: Schema) -> Result<ArrowWriter<File>> {
     let file = File::create(output_path)?;
@@ -921,9 +963,9 @@ pub fn process_authors(
 
     let progress = ProgressBar::new(files_to_process.len() as u64);
     progress.set_style(ProgressStyle::with_template(
-        "[{elapsed_precise}] {bar:50.cyan/blue} {pos:>7}/{len:7} authors files | {msg}",
+        "[{elapsed_precise}] {bar:50.cyan/blue} {pos:>7}/{len:7} files | {msg}",
     )?);
-    progress.set_message("Processing authors...");
+    progress.set_message("Starting authors processing...");
 
     // Memory-efficient buffers - smaller but more frequent flushes
     let authors_buffer = Arc::new(Mutex::new(Vec::with_capacity(batch_size)));
@@ -1108,11 +1150,14 @@ pub fn process_authors(
                 processed_count.fetch_add(local_processed, Ordering::Relaxed) + local_processed;
             progress.inc(1);
 
-            if total_processed % 1_000_000 == 0 {
+            if total_processed % 100_000 == 0 {
+                let files_done = stats.files_processed.load(Ordering::Relaxed);
+                update_progress_with_memory(&progress, "authors", total_processed, files_done, files_to_process.len() as u64);
+                
                 info!(
                     "Processed {} authors across all threads! Memory: {}",
                     total_processed,
-                    get_memory_usage()
+                    get_memory_gb()
                 );
                 
                 // Periodic cleanup of seen_ids to prevent unbounded growth
@@ -1236,9 +1281,9 @@ pub fn process_institutions(
 
     let progress = ProgressBar::new(files_to_process.len() as u64);
     progress.set_style(ProgressStyle::with_template(
-        "[{elapsed_precise}] {bar:50.cyan/blue} {pos:>7}/{len:7} institutions files | {msg}",
+        "[{elapsed_precise}] {bar:50.cyan/blue} {pos:>7}/{len:7} files | {msg}",
     )?);
-    progress.set_message("Processing institutions...");
+    progress.set_message("Starting institutions processing...");
 
     // Thread-safe buffers and deduplication
     let institutions_buffer = Arc::new(Mutex::new(Vec::with_capacity(batch_size)));
@@ -1359,8 +1404,15 @@ pub fn process_institutions(
             let total_processed = processed_count.fetch_add(local_processed, Ordering::Relaxed) + local_processed;
             progress.inc(1);
 
-            if total_processed % 100_000 == 0 {
-                info!("Processed {} institutions across all threads", total_processed);
+            if total_processed % 10_000 == 0 {
+                let files_done = stats.files_processed.load(Ordering::Relaxed);
+                update_progress_with_memory(&progress, "institutions", total_processed, files_done, files_to_process.len() as u64);
+                
+                info!(
+                    "Processed {} institutions across all threads! Memory: {}",
+                    total_processed,
+                    get_memory_gb()
+                );
             }
 
             stats.institutions_processed.fetch_add(local_processed, Ordering::Relaxed);
@@ -1438,9 +1490,9 @@ pub fn process_publishers(
 
     let progress = ProgressBar::new(files_to_process.len() as u64);
     progress.set_style(ProgressStyle::with_template(
-        "[{elapsed_precise}] {bar:50.cyan/blue} {pos:>7}/{len:7} publishers files | {msg}",
+        "[{elapsed_precise}] {bar:50.cyan/blue} {pos:>7}/{len:7} files | {msg}",
     )?);
-    progress.set_message("Processing publishers...");
+    progress.set_message("Starting publishers processing...");
 
     // Thread-safe buffers and deduplication
     let publishers_buffer = Arc::new(Mutex::new(Vec::with_capacity(batch_size)));
@@ -1524,8 +1576,15 @@ pub fn process_publishers(
             let total_processed = processed_count.fetch_add(local_processed, Ordering::Relaxed) + local_processed;
             progress.inc(1);
 
-            if total_processed % 50_000 == 0 {
-                info!("Processed {} publishers across all threads", total_processed);
+            if total_processed % 5_000 == 0 {
+                let files_done = stats.files_processed.load(Ordering::Relaxed);
+                update_progress_with_memory(&progress, "publishers", total_processed, files_done, files_to_process.len() as u64);
+                
+                info!(
+                    "Processed {} publishers across all threads! Memory: {}",
+                    total_processed,
+                    get_memory_gb()
+                );
             }
 
             stats.publishers_processed.fetch_add(local_processed, Ordering::Relaxed);
@@ -1595,9 +1654,9 @@ pub fn process_topics(
 
     let progress = ProgressBar::new(files_to_process.len() as u64);
     progress.set_style(ProgressStyle::with_template(
-        "[{elapsed_precise}] {bar:50.cyan/blue} {pos:>7}/{len:7} topics files | {msg}",
+        "[{elapsed_precise}] {bar:50.cyan/blue} {pos:>7}/{len:7} files | {msg}",
     )?);
-    progress.set_message("Processing topics...");
+    progress.set_message("Starting topics processing...");
 
     // Thread-safe buffers and deduplication
     let topics_buffer = Arc::new(Mutex::new(Vec::with_capacity(batch_size)));
@@ -1698,8 +1757,15 @@ pub fn process_topics(
             let total_processed = processed_count.fetch_add(local_processed, Ordering::Relaxed) + local_processed;
             progress.inc(1);
 
-            if total_processed % 50_000 == 0 {
-                info!("Processed {} topics across all threads", total_processed);
+            if total_processed % 5_000 == 0 {
+                let files_done = stats.files_processed.load(Ordering::Relaxed);
+                update_progress_with_memory(&progress, "topics", total_processed, files_done, files_to_process.len() as u64);
+                
+                info!(
+                    "Processed {} topics across all threads! Memory: {}",
+                    total_processed,
+                    get_memory_gb()
+                );
             }
 
             stats.topics_processed.fetch_add(local_processed, Ordering::Relaxed);
@@ -2089,34 +2155,14 @@ pub fn process_works(
                         
                         // Update progress much more frequently for better monitoring
                         if total_processed % 25_000 == 0 { // Update every 25K instead of 50K
-                            let memory_info = get_memory_usage();
-                            // Extract just the RSS memory for cleaner display
-                            let rss_info = if memory_info.contains("VmRSS:") {
-                                if let Some(rss_start) = memory_info.find("VmRSS:") {
-                                    let rss_part = &memory_info[rss_start..];
-                                    if let Some(rss_end) = rss_part.find('\n') {
-                                        let rss_line = &rss_part[..rss_end];
-                                        if let Some(kb_str) = rss_line.split_whitespace().nth(1) {
-                                            if let Ok(kb) = kb_str.parse::<u64>() {
-                                                format!("{}GB RAM", kb / 1_000_000)
-                                            } else {
-                                                "RAM: unknown".to_string()
-                                            }
-                                        } else {
-                                            "RAM: unknown".to_string()
-                                        }
-                                    } else {
-                                        "RAM: unknown".to_string()
-                                    }
-                                } else {
-                                    "RAM: unknown".to_string()
-                                }
-                            } else {
-                                "RAM: unknown".to_string()
-                            };
+                            let files_done = stats.files_processed.load(Ordering::Relaxed);
+                            update_progress_with_memory(&progress, "works", total_processed, files_done, files_to_process.len() as u64);
                             
-                            progress.set_message(format!("{}M works processed | {}", 
-                                total_processed / 1_000_000, rss_info));
+                            info!(
+                                "Processed {} works across all threads! Memory: {}",
+                                total_processed,
+                                get_memory_gb()
+                            );
                         }
                         
                         // CRITICAL: Periodic cleanup of seen_work_ids to prevent unbounded growth
@@ -2139,6 +2185,9 @@ pub fn process_works(
                                     if let Ok(rss_kb) = rss_str.parse::<u64>() {
                                         // Much more aggressive: If using more than 30GB RSS, force emergency flush
                                         if rss_kb > 30_000_000 {
+                                            info!("EMERGENCY FLUSH: Memory usage {}GB exceeds 30GB limit", 
+                                                rss_kb as f64 / 1_000_000.0);
+                                            
                                             // EMERGENCY: Force flush ALL buffers immediately
                                             flush_local_buffer!(local_works, works_buffer, works_writer, batch_size, works_to_record_batch, 1);
                                             flush_local_buffer!(local_locations, locations_buffer, locations_writer, batch_size, work_locations_to_record_batch, 1);
@@ -2179,38 +2228,11 @@ pub fn process_works(
             // Show file progress for better monitoring with more frequent updates
             let files_done = stats.files_processed.load(Ordering::Relaxed);
             if files_done % 5 == 0 || files_done == 1 { // Update every 5 files or on first file
-                let memory_info = get_memory_usage();
-                // Extract RSS memory for cleaner display
-                let rss_gb = if memory_info.contains("VmRSS:") {
-                    if let Some(rss_start) = memory_info.find("VmRSS:") {
-                        let rss_part = &memory_info[rss_start..];
-                        if let Some(rss_end) = rss_part.find('\n') {
-                            let rss_line = &rss_part[..rss_end];
-                            if let Some(kb_str) = rss_line.split_whitespace().nth(1) {
-                                if let Ok(kb) = kb_str.parse::<u64>() {
-                                    format!("{}GB", kb / 1_000_000)
-                                } else {
-                                    "?GB".to_string()
-                                }
-                            } else {
-                                "?GB".to_string()
-                            }
-                        } else {
-                            "?GB".to_string()
-                        }
-                    } else {
-                        "?GB".to_string()
-                    }
-                } else {
-                    "?GB".to_string()
-                };
-                
                 let works_processed = stats.works_processed.load(Ordering::Relaxed);
-                progress.set_message(format!("File {}/{} | {}M works | {} RAM", 
-                    files_done, files_to_process.len(), works_processed / 1_000_000, rss_gb));
+                update_progress_with_memory(&progress, "works", works_processed, files_done, files_to_process.len() as u64);
                     
-                info!("Processing file {}/{} - {}M works total - {} RAM", 
-                    files_done, files_to_process.len(), works_processed / 1_000_000, rss_gb);
+                info!("Processing file {}/{} - {} works total - {} RAM", 
+                    files_done, files_to_process.len(), works_processed, get_memory_gb());
             }
 
             Ok(())
@@ -2282,9 +2304,9 @@ async fn main() -> Result<()> {
     let conservative_workers = std::cmp::min(max_workers, 32); // Cap at 32 threads for 400GB dataset
     let num_workers = args.workers.unwrap_or(conservative_workers);
 
-    warn!("Using {} workers (max available: {})", num_workers, max_workers);
-    warn!("For 400GB dataset processing with MAXIMUM memory conservation");
-    warn!("All research data will be preserved without truncation");
+    info!("Using {} workers (max available: {})", num_workers, max_workers);
+    info!("Memory-optimized processing with consistent tracking across all entities");
+    info!("All research data will be preserved without truncation");
     info!("Batch size: {} records per batch", args.batch_size);
 
     rayon::ThreadPoolBuilder::new()
