@@ -1212,28 +1212,20 @@ pub fn process_institutions(
         "updated_date" => DataType::Utf8;
     };
 
-    let geo_schema = Schema::new(vec![
-        Field::new("institution_id", DataType::Utf8, false),
-        Field::new("city", DataType::Utf8, true),
-        Field::new("geonames_city_id", DataType::Utf8, true),
-        Field::new("region", DataType::Utf8, true),
-        Field::new("country_code", DataType::Utf8, true),
-        Field::new("country", DataType::Utf8, true),
-        Field::new("latitude", DataType::Float64, true),
-        Field::new("longitude", DataType::Float64, true),
-    ]);
+    let geo_schema = schema! {
+        "institution_id" => DataType::Utf8, false;
+        "city" => DataType::Utf8;
+        "geonames_city_id" => DataType::Utf8;
+        "region" => DataType::Utf8;
+        "country_code" => DataType::Utf8;
+        "country" => DataType::Utf8;
+        "latitude" => DataType::Float64;
+        "longitude" => DataType::Float64;
+    };
 
-    // Create writers
-    let mut institutions_writer = create_parquet_writer(
-        &output_dir.join("institutions.parquet"),
-        institutions_schema,
-    )?;
-    let mut geo_writer =
-        create_parquet_writer(&output_dir.join("institutions_geo.parquet"), geo_schema)?;
-
-    // Create batches
-    let mut institutions_batch = Vec::with_capacity(batch_size);
-    let mut geo_batch = Vec::with_capacity(batch_size);
+    // Create thread-safe writers
+    let institutions_writer = create_writer!(&output_dir.join("institutions.parquet"), institutions_schema);
+    let geo_writer = create_writer!(&output_dir.join("institutions_geo.parquet"), geo_schema);
 
     let files = find_entity_files(input_dir, "institutions")?;
     let files_to_process = if files_per_entity > 0 && files_per_entity < files.len() {
@@ -1248,156 +1240,160 @@ pub fn process_institutions(
     )?);
     progress.set_message("Processing institutions...");
 
-    let mut seen_ids = HashSet::new();
+    // Thread-safe buffers and deduplication
+    let institutions_buffer = Arc::new(Mutex::new(Vec::with_capacity(batch_size)));
+    let geo_buffer = Arc::new(Mutex::new(Vec::with_capacity(batch_size)));
+    let seen_ids = Arc::new(Mutex::new(HashSet::with_capacity(100_000)));
+    let processed_count = Arc::new(AtomicU64::new(0));
 
-    for file_path in files_to_process {
-        let file = File::open(file_path)?;
-        let decoder = GzDecoder::new(file);
-        let reader = BufReader::new(decoder);
+    // Parallel file processing
+    files_to_process
+        .par_iter()
+        .try_for_each(|file_path| -> Result<()> {
+            let file = File::open(file_path)?;
+            let decoder = GzDecoder::new(file);
+            let reader = BufReader::with_capacity(1024 * 1024, decoder);
 
-        for line in reader.lines() {
-            let line = line?;
-            if line.trim().is_empty() {
-                continue;
-            }
+            let mut local_institutions = Vec::with_capacity(2000);
+            let mut local_geo = Vec::with_capacity(2000);
+            let mut local_processed = 0u64;
 
-            let institution: Value = serde_json::from_str(&line)?;
-
-            if let Some(institution_id) = institution.get("id").and_then(|v| v.as_str()) {
-                if seen_ids.contains(institution_id) {
+            for line in reader.lines() {
+                let line = line?;
+                if line.trim().is_empty() {
                     continue;
                 }
-                seen_ids.insert(institution_id.to_string());
 
-                // Main institution record
-                let display_name_acronyms = institution
-                    .get("display_name_acronyms")
-                    .map(|v| serde_json::to_string(v).unwrap_or_default());
-                let display_name_alternatives = institution
-                    .get("display_name_alternatives")
-                    .map(|v| serde_json::to_string(v).unwrap_or_default());
+                let institution: Value = serde_json::from_str(&line)?;
 
-                let record = InstitutionRecord {
-                    id: institution_id.to_string(),
-                    ror: institution
-                        .get("ror")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string()),
-                    display_name: institution
-                        .get("display_name")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string(),
-                    country_code: institution
-                        .get("country_code")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string()),
-                    type_: institution
-                        .get("type")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string()),
-                    homepage_url: institution
-                        .get("homepage_url")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string()),
-                    image_url: institution
-                        .get("image_url")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string()),
-                    image_thumbnail_url: institution
-                        .get("image_thumbnail_url")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string()),
-                    display_name_acronyms,
-                    display_name_alternatives,
-                    works_count: institution
-                        .get("works_count")
-                        .and_then(|v| v.as_i64())
-                        .unwrap_or(0),
-                    cited_by_count: institution
-                        .get("cited_by_count")
-                        .and_then(|v| v.as_i64())
-                        .unwrap_or(0),
-                    works_api_url: institution
-                        .get("works_api_url")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string()),
-                    updated_date: institution
-                        .get("updated_date")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string()),
-                };
-
-                institutions_batch.push(record);
-
-                // Geo record
-                if let Some(geo) = institution.get("geo") {
-                    let geo_record = InstitutionGeoRecord {
-                        institution_id: institution_id.to_string(),
-                        city: geo
-                            .get("city")
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.to_string()),
-                        geonames_city_id: geo
-                            .get("geonames_city_id")
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.to_string()),
-                        region: geo
-                            .get("region")
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.to_string()),
-                        country_code: geo
-                            .get("country_code")
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.to_string()),
-                        country: geo
-                            .get("country")
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.to_string()),
-                        latitude: geo.get("latitude").and_then(|v| v.as_f64()),
-                        longitude: geo.get("longitude").and_then(|v| v.as_f64()),
+                if let Some(institution_id) = institution.get("id").and_then(|v| v.as_str()) {
+                    // Thread-safe duplicate check
+                    let should_process = {
+                        let mut seen = seen_ids.lock().unwrap();
+                        if seen.contains(institution_id) {
+                            false
+                        } else {
+                            seen.insert(institution_id.to_string());
+                            true
+                        }
                     };
-                    geo_batch.push(geo_record);
-                }
 
-                // Write batches when they get large enough
-                if institutions_batch.len() >= batch_size {
-                    write_parquet_batch(
-                        &mut institutions_writer,
-                        std::mem::take(&mut institutions_batch),
+                    if !should_process {
+                        continue;
+                    }
+
+                    // Main institution record
+                    let display_name_acronyms = extract_array_as_string!(institution, "display_name_acronyms");
+                    let display_name_alternatives = extract_array_as_string!(institution, "display_name_alternatives");
+
+                    let record = InstitutionRecord {
+                        id: institution_id.to_string(),
+                        ror: extract_string!(institution, "ror"),
+                        display_name: extract_string_required!(institution, "display_name", "Unknown"),
+                        country_code: extract_string!(institution, "country_code"),
+                        type_: extract_string!(institution, "type"),
+                        homepage_url: extract_string!(institution, "homepage_url"),
+                        image_url: extract_string!(institution, "image_url"),
+                        image_thumbnail_url: extract_string!(institution, "image_thumbnail_url"),
+                        display_name_acronyms,
+                        display_name_alternatives,
+                        works_count: extract_i64!(institution, "works_count", 0),
+                        cited_by_count: extract_i64!(institution, "cited_by_count", 0),
+                        works_api_url: extract_string!(institution, "works_api_url"),
+                        updated_date: extract_string!(institution, "updated_date"),
+                    };
+
+                    local_institutions.push(record);
+
+                    // Geo record
+                    if let Some(geo) = institution.get("geo") {
+                        let geo_record = InstitutionGeoRecord {
+                            institution_id: institution_id.to_string(),
+                            city: extract_string!(geo, "city"),
+                            geonames_city_id: extract_string!(geo, "geonames_city_id"),
+                            region: extract_string!(geo, "region"),
+                            country_code: extract_string!(geo, "country_code"),
+                            country: extract_string!(geo, "country"),
+                            latitude: geo.get("latitude").and_then(|v| v.as_f64()),
+                            longitude: geo.get("longitude").and_then(|v| v.as_f64()),
+                        };
+                        local_geo.push(geo_record);
+                    }
+
+                    local_processed += 1;
+
+                    // Flush local buffers when they get large enough
+                    flush_local_buffer!(
+                        local_institutions,
+                        institutions_buffer,
+                        institutions_writer,
+                        batch_size,
                         institutions_to_record_batch,
-                    )?;
-                }
-                if geo_batch.len() >= batch_size {
-                    write_parquet_batch(
-                        &mut geo_writer,
-                        std::mem::take(&mut geo_batch),
+                        2000
+                    );
+                    flush_local_buffer!(
+                        local_geo,
+                        geo_buffer,
+                        geo_writer,
+                        batch_size,
                         institution_geo_to_record_batch,
-                    )?;
+                        2000
+                    );
                 }
-
-                stats.institutions_processed.fetch_add(1, Ordering::Relaxed);
             }
-        }
 
-        progress.inc(1);
-        stats.files_processed.fetch_add(1, Ordering::Relaxed);
-    }
+            // Flush remaining local data
+            final_flush!(
+                local_institutions,
+                institutions_buffer,
+                institutions_writer,
+                institutions_to_record_batch
+            );
+            final_flush!(
+                local_geo,
+                geo_buffer,
+                geo_writer,
+                institution_geo_to_record_batch
+            );
+
+            let total_processed = processed_count.fetch_add(local_processed, Ordering::Relaxed) + local_processed;
+            progress.inc(1);
+
+            if total_processed % 100_000 == 0 {
+                info!("Processed {} institutions across all threads", total_processed);
+            }
+
+            stats.institutions_processed.fetch_add(local_processed, Ordering::Relaxed);
+            stats.files_processed.fetch_add(1, Ordering::Relaxed);
+
+            Ok(())
+        })?;
 
     // Write remaining batches
-    if !institutions_batch.is_empty() {
-        write_parquet_batch(
-            &mut institutions_writer,
-            institutions_batch,
-            institutions_to_record_batch,
-        )?;
-    }
-    if !geo_batch.is_empty() {
-        write_parquet_batch(&mut geo_writer, geo_batch, institution_geo_to_record_batch)?;
-    }
+    final_flush!(
+        Vec::<InstitutionRecord>::new(),
+        institutions_buffer,
+        institutions_writer,
+        institutions_to_record_batch
+    );
+    final_flush!(
+        Vec::<InstitutionGeoRecord>::new(),
+        geo_buffer,
+        geo_writer,
+        institution_geo_to_record_batch
+    );
 
     // Close writers
+    let institutions_writer = Arc::try_unwrap(institutions_writer)
+        .map_err(|_| anyhow::anyhow!("Failed to unwrap institutions_writer"))?
+        .into_inner()
+        .map_err(|e| anyhow::anyhow!("Failed to lock institutions_writer: {:?}", e))?;
     institutions_writer.close()?;
+
+    let geo_writer = Arc::try_unwrap(geo_writer)
+        .map_err(|_| anyhow::anyhow!("Failed to unwrap geo_writer"))?
+        .into_inner()
+        .map_err(|e| anyhow::anyhow!("Failed to lock geo_writer: {:?}", e))?;
     geo_writer.close()?;
 
     progress.finish_with_message("Institutions processing complete");
@@ -1416,24 +1412,22 @@ pub fn process_publishers(
     files_per_entity: usize,
     stats: &ProcessingStats,
 ) -> Result<()> {
-    info!("Processing Publishers to Parquet...");
+    info!("Processing publishers to Parquet with parallel processing");
 
-    let publishers_schema = Schema::new(vec![
-        Field::new("id", DataType::Utf8, false),
-        Field::new("display_name", DataType::Utf8, false),
-        Field::new("alternate_titles", DataType::Utf8, true),
-        Field::new("country_codes", DataType::Utf8, true),
-        Field::new("hierarchy_level", DataType::Int32, true),
-        Field::new("parent_publisher", DataType::Utf8, true),
-        Field::new("works_count", DataType::Int64, false),
-        Field::new("cited_by_count", DataType::Int64, false),
-        Field::new("sources_api_url", DataType::Utf8, true),
-        Field::new("updated_date", DataType::Utf8, true),
-    ]);
+    let publishers_schema = schema! {
+        "id" => DataType::Utf8, false;
+        "display_name" => DataType::Utf8, false;
+        "alternate_titles" => DataType::Utf8;
+        "country_codes" => DataType::Utf8;
+        "hierarchy_level" => DataType::Int32;
+        "parent_publisher" => DataType::Utf8;
+        "works_count" => DataType::Int64, false;
+        "cited_by_count" => DataType::Int64, false;
+        "sources_api_url" => DataType::Utf8;
+        "updated_date" => DataType::Utf8;
+    };
 
-    let mut publishers_writer =
-        create_parquet_writer(&output_dir.join("publishers.parquet"), publishers_schema)?;
-    let mut publishers_batch = Vec::with_capacity(batch_size);
+    let publishers_writer = create_writer!(&output_dir.join("publishers.parquet"), publishers_schema);
 
     let files = find_entity_files(input_dir, "publishers")?;
     let files_to_process = if files_per_entity > 0 && files_per_entity < files.len() {
@@ -1448,96 +1442,110 @@ pub fn process_publishers(
     )?);
     progress.set_message("Processing publishers...");
 
-    let mut seen_ids = HashSet::new();
+    // Thread-safe buffers and deduplication
+    let publishers_buffer = Arc::new(Mutex::new(Vec::with_capacity(batch_size)));
+    let seen_ids = Arc::new(Mutex::new(HashSet::with_capacity(50_000)));
+    let processed_count = Arc::new(AtomicU64::new(0));
 
-    for file_path in files_to_process {
-        let file = File::open(file_path)?;
-        let decoder = GzDecoder::new(file);
-        let reader = BufReader::new(decoder);
+    // Parallel file processing
+    files_to_process
+        .par_iter()
+        .try_for_each(|file_path| -> Result<()> {
+            let file = File::open(file_path)?;
+            let decoder = GzDecoder::new(file);
+            let reader = BufReader::with_capacity(1024 * 1024, decoder);
 
-        for line in reader.lines() {
-            let line = line?;
-            if line.trim().is_empty() {
-                continue;
-            }
+            let mut local_publishers = Vec::with_capacity(2000);
+            let mut local_processed = 0u64;
 
-            let publisher: Value = serde_json::from_str(&line)?;
-
-            if let Some(publisher_id) = publisher.get("id").and_then(|v| v.as_str()) {
-                if seen_ids.contains(publisher_id) {
+            for line in reader.lines() {
+                let line = line?;
+                if line.trim().is_empty() {
                     continue;
                 }
-                seen_ids.insert(publisher_id.to_string());
 
-                let alternate_titles = publisher
-                    .get("alternate_titles")
-                    .map(|v| serde_json::to_string(v).unwrap_or_default());
-                let country_codes = publisher
-                    .get("country_codes")
-                    .map(|v| serde_json::to_string(v).unwrap_or_default());
+                let publisher: Value = serde_json::from_str(&line)?;
 
-                let record = PublisherRecord {
-                    id: publisher_id.to_string(),
-                    display_name: publisher
-                        .get("display_name")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string(),
-                    alternate_titles,
-                    country_codes,
-                    hierarchy_level: publisher
-                        .get("hierarchy_level")
-                        .and_then(|v| v.as_i64())
-                        .map(|i| i as i32),
-                    parent_publisher: publisher
-                        .get("parent_publisher")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string()),
-                    works_count: publisher
-                        .get("works_count")
-                        .and_then(|v| v.as_i64())
-                        .unwrap_or(0),
-                    cited_by_count: publisher
-                        .get("cited_by_count")
-                        .and_then(|v| v.as_i64())
-                        .unwrap_or(0),
-                    sources_api_url: publisher
-                        .get("sources_api_url")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string()),
-                    updated_date: publisher
-                        .get("updated_date")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string()),
-                };
+                if let Some(publisher_id) = publisher.get("id").and_then(|v| v.as_str()) {
+                    // Thread-safe duplicate check
+                    let should_process = {
+                        let mut seen = seen_ids.lock().unwrap();
+                        if seen.contains(publisher_id) {
+                            false
+                        } else {
+                            seen.insert(publisher_id.to_string());
+                            true
+                        }
+                    };
 
-                publishers_batch.push(record);
+                    if !should_process {
+                        continue;
+                    }
 
-                if publishers_batch.len() >= batch_size {
-                    write_parquet_batch(
-                        &mut publishers_writer,
-                        std::mem::take(&mut publishers_batch),
+                    let alternate_titles = extract_array_as_string!(publisher, "alternate_titles");
+                    let country_codes = extract_array_as_string!(publisher, "country_codes");
+
+                    let record = PublisherRecord {
+                        id: publisher_id.to_string(),
+                        display_name: extract_string_required!(publisher, "display_name", "Unknown"),
+                        alternate_titles,
+                        country_codes,
+                        hierarchy_level: extract_i64_optional!(publisher, "hierarchy_level").map(|i| i as i32),
+                        parent_publisher: extract_string!(publisher, "parent_publisher"),
+                        works_count: extract_i64!(publisher, "works_count", 0),
+                        cited_by_count: extract_i64!(publisher, "cited_by_count", 0),
+                        sources_api_url: extract_string!(publisher, "sources_api_url"),
+                        updated_date: extract_string!(publisher, "updated_date"),
+                    };
+
+                    local_publishers.push(record);
+                    local_processed += 1;
+
+                    // Flush local buffer when it gets large enough
+                    flush_local_buffer!(
+                        local_publishers,
+                        publishers_buffer,
+                        publishers_writer,
+                        batch_size,
                         publishers_to_record_batch,
-                    )?;
+                        2000
+                    );
                 }
-
-                stats.publishers_processed.fetch_add(1, Ordering::Relaxed);
             }
-        }
 
-        progress.inc(1);
-        stats.files_processed.fetch_add(1, Ordering::Relaxed);
-    }
+            // Flush remaining local data
+            final_flush!(
+                local_publishers,
+                publishers_buffer,
+                publishers_writer,
+                publishers_to_record_batch
+            );
+
+            let total_processed = processed_count.fetch_add(local_processed, Ordering::Relaxed) + local_processed;
+            progress.inc(1);
+
+            if total_processed % 50_000 == 0 {
+                info!("Processed {} publishers across all threads", total_processed);
+            }
+
+            stats.publishers_processed.fetch_add(local_processed, Ordering::Relaxed);
+            stats.files_processed.fetch_add(1, Ordering::Relaxed);
+
+            Ok(())
+        })?;
 
     // Write remaining batch
-    if !publishers_batch.is_empty() {
-        write_parquet_batch(
-            &mut publishers_writer,
-            publishers_batch,
-            publishers_to_record_batch,
-        )?;
-    }
+    final_flush!(
+        Vec::<PublisherRecord>::new(),
+        publishers_buffer,
+        publishers_writer,
+        publishers_to_record_batch
+    );
 
+    let publishers_writer = Arc::try_unwrap(publishers_writer)
+        .map_err(|_| anyhow::anyhow!("Failed to unwrap publishers_writer"))?
+        .into_inner()
+        .map_err(|e| anyhow::anyhow!("Failed to lock publishers_writer: {:?}", e))?;
     publishers_writer.close()?;
     progress.finish_with_message("Publishers processing complete");
 
@@ -1555,30 +1563,28 @@ pub fn process_topics(
     files_per_entity: usize,
     stats: &ProcessingStats,
 ) -> Result<()> {
-    info!("Processing Topics to Parquet...");
+    info!("Processing topics to Parquet with parallel processing");
 
-    let topics_schema = Schema::new(vec![
-        Field::new("id", DataType::Utf8, false),
-        Field::new("display_name", DataType::Utf8, false),
-        Field::new("subfield_id", DataType::Utf8, false),
-        Field::new("subfield_display_name", DataType::Utf8, false),
-        Field::new("field_id", DataType::Utf8, false),
-        Field::new("field_display_name", DataType::Utf8, false),
-        Field::new("domain_id", DataType::Utf8, false),
-        Field::new("domain_display_name", DataType::Utf8, false),
-        Field::new("description", DataType::Utf8, true),
-        Field::new("keywords", DataType::Utf8, true),
-        Field::new("works_api_url", DataType::Utf8, true),
-        Field::new("wikipedia_id", DataType::Utf8, true),
-        Field::new("works_count", DataType::Int64, false),
-        Field::new("cited_by_count", DataType::Int64, false),
-        Field::new("updated_date", DataType::Utf8, true),
-        Field::new("siblings", DataType::Utf8, true),
-    ]);
+    let topics_schema = schema! {
+        "id" => DataType::Utf8, false;
+        "display_name" => DataType::Utf8, false;
+        "subfield_id" => DataType::Utf8, false;
+        "subfield_display_name" => DataType::Utf8, false;
+        "field_id" => DataType::Utf8, false;
+        "field_display_name" => DataType::Utf8, false;
+        "domain_id" => DataType::Utf8, false;
+        "domain_display_name" => DataType::Utf8, false;
+        "description" => DataType::Utf8;
+        "keywords" => DataType::Utf8;
+        "works_api_url" => DataType::Utf8;
+        "wikipedia_id" => DataType::Utf8;
+        "works_count" => DataType::Int64, false;
+        "cited_by_count" => DataType::Int64, false;
+        "updated_date" => DataType::Utf8;
+        "siblings" => DataType::Utf8;
+    };
 
-    let mut topics_writer =
-        create_parquet_writer(&output_dir.join("topics.parquet"), topics_schema)?;
-    let mut topics_batch = Vec::with_capacity(batch_size);
+    let topics_writer = create_writer!(&output_dir.join("topics.parquet"), topics_schema);
 
     let files = find_entity_files(input_dir, "topics")?;
     let files_to_process = if files_per_entity > 0 && files_per_entity < files.len() {
@@ -1593,134 +1599,127 @@ pub fn process_topics(
     )?);
     progress.set_message("Processing topics...");
 
-    let mut seen_ids = HashSet::new();
+    // Thread-safe buffers and deduplication
+    let topics_buffer = Arc::new(Mutex::new(Vec::with_capacity(batch_size)));
+    let seen_ids = Arc::new(Mutex::new(HashSet::with_capacity(100_000)));
+    let processed_count = Arc::new(AtomicU64::new(0));
 
-    for file_path in files_to_process {
-        let file = File::open(file_path)?;
-        let decoder = GzDecoder::new(file);
-        let reader = BufReader::new(decoder);
+    // Parallel file processing
+    files_to_process
+        .par_iter()
+        .try_for_each(|file_path| -> Result<()> {
+            let file = File::open(file_path)?;
+            let decoder = GzDecoder::new(file);
+            let reader = BufReader::with_capacity(1024 * 1024, decoder);
 
-        for line in reader.lines() {
-            let line = line?;
-            if line.trim().is_empty() {
-                continue;
-            }
+            let mut local_topics = Vec::with_capacity(2000);
+            let mut local_processed = 0u64;
 
-            let topic: Value = serde_json::from_str(&line)?;
-
-            if let Some(topic_id) = topic.get("id").and_then(|v| v.as_str()) {
-                if seen_ids.contains(topic_id) {
+            for line in reader.lines() {
+                let line = line?;
+                if line.trim().is_empty() {
                     continue;
                 }
-                seen_ids.insert(topic_id.to_string());
 
-                // Extract keywords and join them
-                let keywords = topic.get("keywords").and_then(|v| v.as_array()).map(|arr| {
-                    arr.iter()
-                        .filter_map(|v| v.as_str())
-                        .collect::<Vec<_>>()
-                        .join("; ")
-                });
+                let topic: Value = serde_json::from_str(&line)?;
 
-                let siblings = topic
-                    .get("siblings")
-                    .map(|v| serde_json::to_string(v).unwrap_or_default());
+                if let Some(topic_id) = topic.get("id").and_then(|v| v.as_str()) {
+                    // Thread-safe duplicate check
+                    let should_process = {
+                        let mut seen = seen_ids.lock().unwrap();
+                        if seen.contains(topic_id) {
+                            false
+                        } else {
+                            seen.insert(topic_id.to_string());
+                            true
+                        }
+                    };
 
-                let record = TopicRecord {
-                    id: topic_id.to_string(),
-                    display_name: topic
-                        .get("display_name")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string(),
-                    subfield_id: topic
-                        .get("subfield")
-                        .and_then(|v| v.get("id"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string(),
-                    subfield_display_name: topic
-                        .get("subfield")
-                        .and_then(|v| v.get("display_name"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string(),
-                    field_id: topic
-                        .get("field")
-                        .and_then(|v| v.get("id"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string(),
-                    field_display_name: topic
-                        .get("field")
-                        .and_then(|v| v.get("display_name"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string(),
-                    domain_id: topic
-                        .get("domain")
-                        .and_then(|v| v.get("id"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string(),
-                    domain_display_name: topic
-                        .get("domain")
-                        .and_then(|v| v.get("display_name"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string(),
-                    description: topic
-                        .get("description")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string()),
-                    keywords,
-                    works_api_url: topic
-                        .get("works_api_url")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string()),
-                    wikipedia_id: topic
-                        .get("ids")
-                        .and_then(|v| v.get("wikipedia"))
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string()),
-                    works_count: topic
-                        .get("works_count")
-                        .and_then(|v| v.as_i64())
-                        .unwrap_or(0),
-                    cited_by_count: topic
-                        .get("cited_by_count")
-                        .and_then(|v| v.as_i64())
-                        .unwrap_or(0),
-                    updated_date: topic
-                        .get("updated")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string()),
-                    siblings,
-                };
+                    if !should_process {
+                        continue;
+                    }
 
-                topics_batch.push(record);
+                    // Extract keywords and join them
+                    let keywords = topic.get("keywords").and_then(|v| v.as_array()).map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str())
+                            .collect::<Vec<_>>()
+                            .join("; ")
+                    });
 
-                if topics_batch.len() >= batch_size {
-                    write_parquet_batch(
-                        &mut topics_writer,
-                        std::mem::take(&mut topics_batch),
+                    let siblings = extract_array_as_string!(topic, "siblings");
+
+                    let record = TopicRecord {
+                        id: topic_id.to_string(),
+                        display_name: extract_string_required!(topic, "display_name", "Unknown"),
+                        subfield_id: extract_nested_string!(topic, "subfield", "id").unwrap_or_else(|| "Unknown".to_string()),
+                        subfield_display_name: extract_nested_string!(topic, "subfield", "display_name").unwrap_or_else(|| "Unknown".to_string()),
+                        field_id: extract_nested_string!(topic, "field", "id").unwrap_or_else(|| "Unknown".to_string()),
+                        field_display_name: extract_nested_string!(topic, "field", "display_name").unwrap_or_else(|| "Unknown".to_string()),
+                        domain_id: extract_nested_string!(topic, "domain", "id").unwrap_or_else(|| "Unknown".to_string()),
+                        domain_display_name: extract_nested_string!(topic, "domain", "display_name").unwrap_or_else(|| "Unknown".to_string()),
+                        description: extract_string!(topic, "description"),
+                        keywords,
+                        works_api_url: extract_string!(topic, "works_api_url"),
+                        wikipedia_id: topic
+                            .get("ids")
+                            .and_then(|v| v.get("wikipedia"))
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string()),
+                        works_count: extract_i64!(topic, "works_count", 0),
+                        cited_by_count: extract_i64!(topic, "cited_by_count", 0),
+                        updated_date: extract_string!(topic, "updated"),
+                        siblings,
+                    };
+
+                    local_topics.push(record);
+                    local_processed += 1;
+
+                    // Flush local buffer when it gets large enough
+                    flush_local_buffer!(
+                        local_topics,
+                        topics_buffer,
+                        topics_writer,
+                        batch_size,
                         topics_to_record_batch,
-                    )?;
+                        2000
+                    );
                 }
-
-                stats.topics_processed.fetch_add(1, Ordering::Relaxed);
             }
-        }
 
-        progress.inc(1);
-        stats.files_processed.fetch_add(1, Ordering::Relaxed);
-    }
+            // Flush remaining local data
+            final_flush!(
+                local_topics,
+                topics_buffer,
+                topics_writer,
+                topics_to_record_batch
+            );
+
+            let total_processed = processed_count.fetch_add(local_processed, Ordering::Relaxed) + local_processed;
+            progress.inc(1);
+
+            if total_processed % 50_000 == 0 {
+                info!("Processed {} topics across all threads", total_processed);
+            }
+
+            stats.topics_processed.fetch_add(local_processed, Ordering::Relaxed);
+            stats.files_processed.fetch_add(1, Ordering::Relaxed);
+
+            Ok(())
+        })?;
 
     // Write remaining batch
-    if !topics_batch.is_empty() {
-        write_parquet_batch(&mut topics_writer, topics_batch, topics_to_record_batch)?;
-    }
+    final_flush!(
+        Vec::<TopicRecord>::new(),
+        topics_buffer,
+        topics_writer,
+        topics_to_record_batch
+    );
 
+    let topics_writer = Arc::try_unwrap(topics_writer)
+        .map_err(|_| anyhow::anyhow!("Failed to unwrap topics_writer"))?
+        .into_inner()
+        .map_err(|e| anyhow::anyhow!("Failed to lock topics_writer: {:?}", e))?;
     topics_writer.close()?;
     progress.finish_with_message("Topics processing complete");
 
@@ -1740,60 +1739,60 @@ pub fn process_works(
 ) -> Result<()> {
     info!("Processing Works to Parquet with memory-optimized parallelization!");
 
-    // Create schemas
-    let works_schema = Schema::new(vec![
-        Field::new("id", DataType::Utf8, false),
-        Field::new("doi", DataType::Utf8, true),
-        Field::new("title", DataType::LargeUtf8, true), // Use LargeUtf8 for potentially large titles
-        Field::new("display_name", DataType::LargeUtf8, false), // Use LargeUtf8 for display names
-        Field::new("publication_year", DataType::Int32, true),
-        Field::new("publication_date", DataType::Utf8, true),
-        Field::new("type", DataType::Utf8, true),
-        Field::new("cited_by_count", DataType::Int64, false),
-        Field::new("is_retracted", DataType::Boolean, false),
-        Field::new("is_paratext", DataType::Boolean, true),
-        Field::new("cited_by_api_url", DataType::Utf8, true),
-        Field::new("abstract_inverted_index", DataType::LargeUtf8, true), // Use LargeUtf8 for abstracts
-        Field::new("language", DataType::Utf8, true),
-    ]);
+    // Create schemas with consistent string types
+    let works_schema = schema! {
+        "id" => DataType::Utf8, false;
+        "doi" => DataType::Utf8;
+        "title" => DataType::LargeUtf8;
+        "display_name" => DataType::LargeUtf8, false;
+        "publication_year" => DataType::Int32;
+        "publication_date" => DataType::Utf8;
+        "type" => DataType::Utf8;
+        "cited_by_count" => DataType::Int64, false;
+        "is_retracted" => DataType::Boolean, false;
+        "is_paratext" => DataType::Boolean;
+        "cited_by_api_url" => DataType::Utf8;
+        "abstract_inverted_index" => DataType::LargeUtf8;
+        "language" => DataType::Utf8;
+    };
 
-    let locations_schema = Schema::new(vec![
-        Field::new("work_id", DataType::Utf8, false),
-        Field::new("source_id", DataType::Utf8, true),
-        Field::new("landing_page_url", DataType::LargeUtf8, true), // URLs can be very long
-        Field::new("pdf_url", DataType::LargeUtf8, true),          // URLs can be very long
-        Field::new("is_oa", DataType::Boolean, true),
-        Field::new("version", DataType::Utf8, true),
-        Field::new("license", DataType::Utf8, true),
-        Field::new("location_type", DataType::Utf8, false),
-    ]);
+    let locations_schema = schema! {
+        "work_id" => DataType::Utf8, false;
+        "source_id" => DataType::Utf8;
+        "landing_page_url" => DataType::LargeUtf8;
+        "pdf_url" => DataType::LargeUtf8;
+        "is_oa" => DataType::Boolean;
+        "version" => DataType::Utf8;
+        "license" => DataType::Utf8;
+        "location_type" => DataType::Utf8, false;
+    };
 
-    let authorships_schema = Schema::new(vec![
-        Field::new("work_id", DataType::Utf8, false),
-        Field::new("author_position", DataType::Utf8, false),
-        Field::new("author_id", DataType::Utf8, false),
-        Field::new("institution_id", DataType::Utf8, true),
-        Field::new("raw_affiliation_string", DataType::LargeUtf8, true), // Can be very long
-    ]);
+    let authorships_schema = schema! {
+        "work_id" => DataType::Utf8, false;
+        "author_position" => DataType::Utf8, false;
+        "author_id" => DataType::Utf8, false;
+        "institution_id" => DataType::Utf8;
+        "raw_affiliation_string" => DataType::LargeUtf8;
+    };
 
-    let topics_schema = Schema::new(vec![
-        Field::new("work_id", DataType::Utf8, false),
-        Field::new("topic_id", DataType::Utf8, false),
-        Field::new("score", DataType::Float64, true),
-    ]);
+    let topics_schema = schema! {
+        "work_id" => DataType::Utf8, false;
+        "topic_id" => DataType::Utf8, false;
+        "score" => DataType::Float64;
+    };
 
-    let open_access_schema = Schema::new(vec![
-        Field::new("work_id", DataType::Utf8, false),
-        Field::new("is_oa", DataType::Boolean, true),
-        Field::new("oa_status", DataType::Utf8, true),
-        Field::new("oa_url", DataType::Utf8, true),
-        Field::new("any_repository_has_fulltext", DataType::Boolean, true),
-    ]);
+    let open_access_schema = schema! {
+        "work_id" => DataType::Utf8, false;
+        "is_oa" => DataType::Boolean;
+        "oa_status" => DataType::Utf8;
+        "oa_url" => DataType::LargeUtf8;
+        "any_repository_has_fulltext" => DataType::Boolean;
+    };
 
-    let citations_schema = Schema::new(vec![
-        Field::new("work_id", DataType::Utf8, false),
-        Field::new("referenced_work_id", DataType::Utf8, false),
-    ]);
+    let citations_schema = schema! {
+        "work_id" => DataType::Utf8, false;
+        "referenced_work_id" => DataType::Utf8, false;
+    };
 
     // Create thread-safe writers (thread-safe)
     let works_writer = create_writer!(&output_dir.join("works.parquet"), works_schema);
@@ -1827,6 +1826,9 @@ pub fn process_works(
     let citations_buffer = Arc::new(Mutex::new(Vec::with_capacity(batch_size / 2)));   // Even smaller
 
     let processed_count = Arc::new(AtomicU64::new(0));
+    
+    // CRITICAL FIX: Add duplicate detection for works (was missing!)
+    let seen_work_ids = Arc::new(Mutex::new(HashSet::with_capacity(10_000_000))); // Large capacity for works
 
     info!(
         "Processing {} files with {} cores optimized for memory efficiency",
@@ -1859,6 +1861,21 @@ pub fn process_works(
                 let work: Value = serde_json::from_str(&line)?;
 
                 if let Some(work_id) = work.get("id").and_then(|v| v.as_str()) {
+                    // CRITICAL FIX: Add duplicate checking for works
+                    let should_process = {
+                        let mut seen = seen_work_ids.lock().unwrap();
+                        if seen.contains(work_id) {
+                            false
+                        } else {
+                            seen.insert(work_id.to_string());
+                            true
+                        }
+                    };
+
+                    if !should_process {
+                        continue;
+                    }
+
                     // Process ALL data - preserve full content for research evaluation
                     let title = work
                         .get("title")
@@ -1953,7 +1970,7 @@ pub fn process_works(
                         }
                     }
 
-                    // Process ALL authorships (don't limit - this is important citation data)
+                    // FIXED: Process authorships with consistent logic to prevent double-counting
                     if let Some(authorships) = work.get("authorships").and_then(|v| v.as_array()) {
                         for authorship in authorships {
                             if let Some(author_id) = authorship
@@ -1961,69 +1978,40 @@ pub fn process_works(
                                 .and_then(|a| a.get("id"))
                                 .and_then(|v| v.as_str())
                             {
-                                // Handle multiple institutions per author
+                                // FIXED: Create ONE record per author per work, aggregating institutions
                                 let institutions = authorship
                                     .get("institutions")
                                     .and_then(|v| v.as_array());
                                 
-                                if let Some(institutions) = institutions {
-                                    if institutions.is_empty() {
-                                        // No institutions - create one record with null institution
-                                        let authorship_record = WorkAuthorshipRecord {
-                                            work_id: work_id.to_string(),
-                                            author_position: authorship
-                                                .get("author_position")
-                                                .and_then(|v| v.as_str())
-                                                .unwrap_or("unknown")
-                                                .to_string(),
-                                            author_id: author_id.to_string(),
-                                            institution_id: None,
-                                            raw_affiliation_string: authorship
-                                                .get("raw_affiliation_string")
-                                                .and_then(|v| v.as_str())
-                                                .map(|s| s.to_string()),
-                                        };
-                                        local_authorships.push(authorship_record);
-                                    } else {
-                                        // Create record for each institution
-                                        for institution in institutions {
-                                            if let Some(institution_id) = institution.get("id").and_then(|v| v.as_str()) {
-                                                let authorship_record = WorkAuthorshipRecord {
-                                                    work_id: work_id.to_string(),
-                                                    author_position: authorship
-                                                        .get("author_position")
-                                                        .and_then(|v| v.as_str())
-                                                        .unwrap_or("unknown")
-                                                        .to_string(),
-                                                    author_id: author_id.to_string(),
-                                                    institution_id: Some(institution_id.to_string()),
-                                                    raw_affiliation_string: authorship
-                                                        .get("raw_affiliation_string")
-                                                        .and_then(|v| v.as_str())
-                                                        .map(|s| s.to_string()),
-                                                };
-                                                local_authorships.push(authorship_record);
-                                            }
-                                        }
-                                    }
+                                // Aggregate all institution IDs for this author on this work
+                                let institution_ids: Vec<String> = if let Some(institutions) = institutions {
+                                    institutions
+                                        .iter()
+                                        .filter_map(|inst| inst.get("id").and_then(|v| v.as_str()))
+                                        .map(|s| s.to_string())
+                                        .collect()
                                 } else {
-                                    // No institutions - create one record with null institution
-                                    let authorship_record = WorkAuthorshipRecord {
-                                        work_id: work_id.to_string(),
-                                        author_position: authorship
-                                            .get("author_position")
-                                            .and_then(|v| v.as_str())
-                                            .unwrap_or("unknown")
-                                            .to_string(),
-                                        author_id: author_id.to_string(),
-                                        institution_id: None,
-                                        raw_affiliation_string: authorship
-                                            .get("raw_affiliation_string")
-                                            .and_then(|v| v.as_str())
-                                            .map(|s| s.to_string()), 
-                                    };
-                                    local_authorships.push(authorship_record);
-                                }
+                                    Vec::new()
+                                };
+
+                                // Create a single record with primary institution (first one) or None
+                                let primary_institution = institution_ids.first().cloned();
+                                
+                                let authorship_record = WorkAuthorshipRecord {
+                                    work_id: work_id.to_string(),
+                                    author_position: authorship
+                                        .get("author_position")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("unknown")
+                                        .to_string(),
+                                    author_id: author_id.to_string(),
+                                    institution_id: primary_institution,
+                                    raw_affiliation_string: authorship
+                                        .get("raw_affiliation_string")
+                                        .and_then(|v| v.as_str())
+                                        .map(|s| s.to_string()),
+                                };
+                                local_authorships.push(authorship_record);
                             }
                         }
                     }
@@ -2129,6 +2117,14 @@ pub fn process_works(
                             
                             progress.set_message(format!("{}M works processed | {}", 
                                 total_processed / 1_000_000, rss_info));
+                        }
+                        
+                        // CRITICAL: Periodic cleanup of seen_work_ids to prevent unbounded growth
+                        if total_processed % 10_000_000 == 0 {
+                            let mut seen = seen_work_ids.lock().unwrap();
+                            let old_size = seen.len();
+                            seen.shrink_to_fit();
+                            info!("Cleaned seen_work_ids: {} -> {} entries", old_size, seen.len());
                         }
                     }
 
@@ -2377,7 +2373,7 @@ async fn main() -> Result<()> {
     info!("  Citation edges: {}", stats.citation_edges.load(Ordering::Relaxed));
     info!("  Files processed: {}", stats.files_processed.load(Ordering::Relaxed));
 
-    info!("PySpark-ready Parquet datasets created successfully in: {}", args.output_dir);
+    info!("Parquet datasets created successfully in: {}", args.output_dir);
 
     Ok(())
 }
