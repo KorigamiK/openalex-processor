@@ -326,7 +326,7 @@ fn create_parquet_writer(output_path: &Path, schema: Schema) -> Result<ArrowWrit
     let file = File::create(output_path)?;
     let props = WriterProperties::builder()
         .set_compression(parquet::basic::Compression::SNAPPY)
-        .set_write_batch_size(5_000_000) // MASSIVE batch size for your 150GB RAM beast!
+        .set_write_batch_size(5_000_000) // Large batch size for efficient processing
         .set_max_row_group_size(50_000_000) // Huge row groups for maximum compression
         .set_data_page_size_limit(2_000_000) // Large data pages
         .set_dictionary_page_size_limit(2_000_000) // Large dictionary pages
@@ -905,7 +905,7 @@ fn write_parquet_batch<T: 'static + Send + Sync>(
     Ok(())
 }
 
-// ====== AUTHORS PROCESSING (PARALLEL VERSION FOR 250-CORE MACHINE) ======
+// ====== AUTHORS PROCESSING (PARALLEL VERSION) ======
 pub fn process_authors(
     input_dir: &str,
     output_dir: &Path,
@@ -966,6 +966,9 @@ pub fn process_authors(
         "[{elapsed_precise}] {bar:50.cyan/blue} {pos:>7}/{len:7} files | {msg}",
     )?);
     progress.set_message("Starting authors processing...");
+    
+    // Initial progress update
+    update_progress_with_memory(&progress, "authors", 0, 0, files_to_process.len() as u64);
 
     // Memory-efficient buffers - smaller but more frequent flushes
     let authors_buffer = Arc::new(Mutex::new(Vec::with_capacity(batch_size)));
@@ -1148,12 +1151,19 @@ pub fn process_authors(
 
             let total_processed =
                 processed_count.fetch_add(local_processed, Ordering::Relaxed) + local_processed;
+            
+            stats
+                .authors_processed
+                .fetch_add(local_processed, Ordering::Relaxed);
+            stats.files_processed.fetch_add(1, Ordering::Relaxed);
+            
             progress.inc(1);
+            
+            // Update progress bar for every file processed
+            let files_done = stats.files_processed.load(Ordering::Relaxed);
+            update_progress_with_memory(&progress, "authors", total_processed, files_done, files_to_process.len() as u64);
 
             if total_processed % 100_000 == 0 {
-                let files_done = stats.files_processed.load(Ordering::Relaxed);
-                update_progress_with_memory(&progress, "authors", total_processed, files_done, files_to_process.len() as u64);
-                
                 info!(
                     "Processed {} authors across all threads! Memory: {}",
                     total_processed,
@@ -1168,11 +1178,6 @@ pub fn process_authors(
                     info!("Cleaned seen_ids: {} -> {} entries", old_size, seen.len());
                 }
             }
-
-            stats
-                .authors_processed
-                .fetch_add(local_processed, Ordering::Relaxed);
-            stats.files_processed.fetch_add(1, Ordering::Relaxed);
 
             Ok(())
         })
@@ -1284,6 +1289,9 @@ pub fn process_institutions(
         "[{elapsed_precise}] {bar:50.cyan/blue} {pos:>7}/{len:7} files | {msg}",
     )?);
     progress.set_message("Starting institutions processing...");
+    
+    // Initial progress update
+    update_progress_with_memory(&progress, "institutions", 0, 0, files_to_process.len() as u64);
 
     // Thread-safe buffers and deduplication
     let institutions_buffer = Arc::new(Mutex::new(Vec::with_capacity(batch_size)));
@@ -1402,21 +1410,23 @@ pub fn process_institutions(
             );
 
             let total_processed = processed_count.fetch_add(local_processed, Ordering::Relaxed) + local_processed;
+            
+            stats.institutions_processed.fetch_add(local_processed, Ordering::Relaxed);
+            stats.files_processed.fetch_add(1, Ordering::Relaxed);
+            
             progress.inc(1);
+            
+            // Update progress bar for every file processed
+            let files_done = stats.files_processed.load(Ordering::Relaxed);
+            update_progress_with_memory(&progress, "institutions", total_processed, files_done, files_to_process.len() as u64);
 
             if total_processed % 10_000 == 0 {
-                let files_done = stats.files_processed.load(Ordering::Relaxed);
-                update_progress_with_memory(&progress, "institutions", total_processed, files_done, files_to_process.len() as u64);
-                
                 info!(
                     "Processed {} institutions across all threads! Memory: {}",
                     total_processed,
                     get_memory_gb()
                 );
             }
-
-            stats.institutions_processed.fetch_add(local_processed, Ordering::Relaxed);
-            stats.files_processed.fetch_add(1, Ordering::Relaxed);
 
             Ok(())
         })?;
@@ -1493,6 +1503,9 @@ pub fn process_publishers(
         "[{elapsed_precise}] {bar:50.cyan/blue} {pos:>7}/{len:7} files | {msg}",
     )?);
     progress.set_message("Starting publishers processing...");
+    
+    // Initial progress update
+    update_progress_with_memory(&progress, "publishers", 0, 0, files_to_process.len() as u64);
 
     // Thread-safe buffers and deduplication
     let publishers_buffer = Arc::new(Mutex::new(Vec::with_capacity(batch_size)));
@@ -1574,21 +1587,23 @@ pub fn process_publishers(
             );
 
             let total_processed = processed_count.fetch_add(local_processed, Ordering::Relaxed) + local_processed;
+            
+            stats.publishers_processed.fetch_add(local_processed, Ordering::Relaxed);
+            stats.files_processed.fetch_add(1, Ordering::Relaxed);
+            
             progress.inc(1);
+            
+            // Update progress bar for every file processed
+            let files_done = stats.files_processed.load(Ordering::Relaxed);
+            update_progress_with_memory(&progress, "publishers", total_processed, files_done, files_to_process.len() as u64);
 
             if total_processed % 5_000 == 0 {
-                let files_done = stats.files_processed.load(Ordering::Relaxed);
-                update_progress_with_memory(&progress, "publishers", total_processed, files_done, files_to_process.len() as u64);
-                
                 info!(
                     "Processed {} publishers across all threads! Memory: {}",
                     total_processed,
                     get_memory_gb()
                 );
             }
-
-            stats.publishers_processed.fetch_add(local_processed, Ordering::Relaxed);
-            stats.files_processed.fetch_add(1, Ordering::Relaxed);
 
             Ok(())
         })?;
@@ -1657,6 +1672,9 @@ pub fn process_topics(
         "[{elapsed_precise}] {bar:50.cyan/blue} {pos:>7}/{len:7} files | {msg}",
     )?);
     progress.set_message("Starting topics processing...");
+    
+    // Initial progress update
+    update_progress_with_memory(&progress, "topics", 0, 0, files_to_process.len() as u64);
 
     // Thread-safe buffers and deduplication
     let topics_buffer = Arc::new(Mutex::new(Vec::with_capacity(batch_size)));
@@ -1755,21 +1773,23 @@ pub fn process_topics(
             );
 
             let total_processed = processed_count.fetch_add(local_processed, Ordering::Relaxed) + local_processed;
+            
+            stats.topics_processed.fetch_add(local_processed, Ordering::Relaxed);
+            stats.files_processed.fetch_add(1, Ordering::Relaxed);
+            
             progress.inc(1);
+            
+            // Update progress bar for every file processed
+            let files_done = stats.files_processed.load(Ordering::Relaxed);
+            update_progress_with_memory(&progress, "topics", total_processed, files_done, files_to_process.len() as u64);
 
             if total_processed % 5_000 == 0 {
-                let files_done = stats.files_processed.load(Ordering::Relaxed);
-                update_progress_with_memory(&progress, "topics", total_processed, files_done, files_to_process.len() as u64);
-                
                 info!(
                     "Processed {} topics across all threads! Memory: {}",
                     total_processed,
                     get_memory_gb()
                 );
             }
-
-            stats.topics_processed.fetch_add(local_processed, Ordering::Relaxed);
-            stats.files_processed.fetch_add(1, Ordering::Relaxed);
 
             Ok(())
         })?;
@@ -1795,7 +1815,7 @@ pub fn process_topics(
     Ok(())
 }
 
-// ====== WORKS PROCESSING (PARALLEL VERSION FOR 128-CORE BEAST!) ======
+// ====== WORKS PROCESSING (PARALLEL VERSION) ======
 pub fn process_works(
     input_dir: &str,
     output_dir: &Path,
@@ -1882,8 +1902,11 @@ pub fn process_works(
     
     // Set initial progress message
     progress.set_message("Starting works processing...");
+    
+    // Initial progress update
+    update_progress_with_memory(&progress, "works", 0, 0, files_to_process.len() as u64);
 
-    // ULTRA-conservative shared buffers for 400GB dataset - prioritize frequent writes over memory
+    // Conservative shared buffers - prioritize frequent writes over memory
     let works_buffer = Arc::new(Mutex::new(Vec::with_capacity(batch_size / 8)));       // Even smaller
     let locations_buffer = Arc::new(Mutex::new(Vec::with_capacity(batch_size / 8)));   // Even smaller
     let authorships_buffer = Arc::new(Mutex::new(Vec::with_capacity(batch_size / 4))); // Even smaller
@@ -1902,7 +1925,7 @@ pub fn process_works(
         num_cpus::get()
     );
 
-    // PARALLEL FILE PROCESSING - USE ALL 128 CORES!
+    // PARALLEL FILE PROCESSING
     files_to_process
         .par_iter()
         .try_for_each(|file_path| -> Result<()> {
@@ -2174,7 +2197,7 @@ pub fn process_works(
                         }
                     }
 
-                    // CRITICAL: Memory pressure relief system for 400GB dataset
+                    // Memory pressure relief system
                     if local_processed % 1000 == 0 { // Check more frequently
                         // Check memory usage and force global flush if needed
                         let memory_info = get_memory_usage();
@@ -2222,15 +2245,16 @@ pub fn process_works(
             final_flush!(local_open_access, open_access_buffer, open_access_writer, work_open_access_to_record_batch);
             final_flush!(local_citations, citations_buffer, citations_writer, citations_to_record_batch);
 
-            progress.inc(1);
             stats.files_processed.fetch_add(1, Ordering::Relaxed);
+            progress.inc(1);
+            
+            // Update progress bar for every file processed
+            let files_done = stats.files_processed.load(Ordering::Relaxed);
+            let works_processed = stats.works_processed.load(Ordering::Relaxed);
+            update_progress_with_memory(&progress, "works", works_processed, files_done, files_to_process.len() as u64);
             
             // Show file progress for better monitoring with more frequent updates
-            let files_done = stats.files_processed.load(Ordering::Relaxed);
             if files_done % 5 == 0 || files_done == 1 { // Update every 5 files or on first file
-                let works_processed = stats.works_processed.load(Ordering::Relaxed);
-                update_progress_with_memory(&progress, "works", works_processed, files_done, files_to_process.len() as u64);
-                    
                 info!("Processing file {}/{} - {} works total - {} RAM", 
                     files_done, files_to_process.len(), works_processed, get_memory_gb());
             }
@@ -2298,16 +2322,15 @@ async fn main() -> Result<()> {
 
     let args = Cli::parse();
 
-    // Set up thread pool - be VERY conservative for 400GB dataset memory management
+    // Set up thread pool - conservative memory management
     let max_workers = num_cpus::get();
     // For works processing, use even fewer threads to prevent memory explosion
-    let conservative_workers = std::cmp::min(max_workers, 32); // Cap at 32 threads for 400GB dataset
+    let conservative_workers = std::cmp::min(max_workers, 32); // Cap at 32 threads for memory efficiency
     let num_workers = args.workers.unwrap_or(conservative_workers);
 
     info!("Using {} workers (max available: {})", num_workers, max_workers);
     info!("Memory-optimized processing with consistent tracking across all entities");
-    info!("All research data will be preserved without truncation");
-    info!("Batch size: {} records per batch", args.batch_size);
+    info!("Processing with batch size: {} records per batch", args.batch_size);
 
     rayon::ThreadPoolBuilder::new()
         .num_threads(num_workers)
