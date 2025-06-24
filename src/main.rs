@@ -218,7 +218,7 @@ macro_rules! record_batch {
 
 #[derive(Parser)]
 #[command(name = "openalex_processor")]
-#[command(about = "OpenAlex Academic Data Processor - Creates PySpark-ready Parquet datasets")]
+#[command(about = "OpenAlex Academic Data Processor")]
 struct Cli {
     /// Input directory containing OpenAlex snapshot
     #[arg(short, long, default_value = "../download/openalex-snapshot/data")]
@@ -2286,7 +2286,7 @@ async fn main() -> Result<()> {
     let conservative_workers = std::cmp::min(max_workers, 32); // Cap at 32 threads for 400GB dataset
     let num_workers = args.workers.unwrap_or(conservative_workers);
 
-    warn!("ULTRA-MEMORY-CONSERVATIVE MODE: Using {} workers (max available: {})", num_workers, max_workers);
+    warn!("Using {} workers (max available: {})", num_workers, max_workers);
     warn!("For 400GB dataset processing with MAXIMUM memory conservation");
     warn!("All research data will be preserved without truncation");
     info!("Batch size: {} records per batch", args.batch_size);
