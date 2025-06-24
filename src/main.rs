@@ -921,8 +921,9 @@ pub fn process_authors(
 
     let progress = ProgressBar::new(files_to_process.len() as u64);
     progress.set_style(ProgressStyle::with_template(
-        "[{elapsed_precise}] {bar:50.cyan/blue} {pos:>7}/{len:7} authors files ({eta})",
+        "[{elapsed_precise}] {bar:50.cyan/blue} {pos:>7}/{len:7} authors files | {msg}",
     )?);
+    progress.set_message("Processing authors...");
 
     // Memory-efficient buffers - smaller but more frequent flushes
     let authors_buffer = Arc::new(Mutex::new(Vec::with_capacity(batch_size)));
@@ -1109,7 +1110,7 @@ pub fn process_authors(
 
             if total_processed % 1_000_000 == 0 {
                 info!(
-                    "🔥 Processed {} authors across all threads! Memory: {}",
+                    "Processed {} authors across all threads! Memory: {}",
                     total_processed,
                     get_memory_usage()
                 );
@@ -1243,8 +1244,9 @@ pub fn process_institutions(
 
     let progress = ProgressBar::new(files_to_process.len() as u64);
     progress.set_style(ProgressStyle::with_template(
-        "[{elapsed_precise}] {bar:50.cyan/blue} {pos:>7}/{len:7} institutions files ({eta})",
+        "[{elapsed_precise}] {bar:50.cyan/blue} {pos:>7}/{len:7} institutions files | {msg}",
     )?);
+    progress.set_message("Processing institutions...");
 
     let mut seen_ids = HashSet::new();
 
@@ -1414,7 +1416,7 @@ pub fn process_publishers(
     files_per_entity: usize,
     stats: &ProcessingStats,
 ) -> Result<()> {
-    info!("📰 Processing Publishers to Parquet...");
+    info!("Processing Publishers to Parquet...");
 
     let publishers_schema = Schema::new(vec![
         Field::new("id", DataType::Utf8, false),
@@ -1442,8 +1444,9 @@ pub fn process_publishers(
 
     let progress = ProgressBar::new(files_to_process.len() as u64);
     progress.set_style(ProgressStyle::with_template(
-        "[{elapsed_precise}] {bar:50.cyan/blue} {pos:>7}/{len:7} publishers files ({eta})",
+        "[{elapsed_precise}] {bar:50.cyan/blue} {pos:>7}/{len:7} publishers files | {msg}",
     )?);
+    progress.set_message("Processing publishers...");
 
     let mut seen_ids = HashSet::new();
 
@@ -1552,7 +1555,7 @@ pub fn process_topics(
     files_per_entity: usize,
     stats: &ProcessingStats,
 ) -> Result<()> {
-    info!("🏷️ Processing Topics to Parquet...");
+    info!("Processing Topics to Parquet...");
 
     let topics_schema = Schema::new(vec![
         Field::new("id", DataType::Utf8, false),
@@ -1586,8 +1589,9 @@ pub fn process_topics(
 
     let progress = ProgressBar::new(files_to_process.len() as u64);
     progress.set_style(ProgressStyle::with_template(
-        "[{elapsed_precise}] {bar:50.cyan/blue} {pos:>7}/{len:7} topics files ({eta})",
+        "[{elapsed_precise}] {bar:50.cyan/blue} {pos:>7}/{len:7} topics files | {msg}",
     )?);
+    progress.set_message("Processing topics...");
 
     let mut seen_ids = HashSet::new();
 
@@ -1734,7 +1738,7 @@ pub fn process_works(
     files_per_entity: usize,
     stats: &ProcessingStats,
 ) -> Result<()> {
-    info!("🚀 Processing Works to Parquet with FULL 128-CORE PARALLELIZATION!");
+    info!("Processing Works to Parquet with memory-optimized parallelization!");
 
     // Create schemas
     let works_schema = Schema::new(vec![
@@ -1808,21 +1812,24 @@ pub fn process_works(
 
     let progress = ProgressBar::new(files_to_process.len() as u64);
     progress.set_style(ProgressStyle::with_template(
-        "[{elapsed_precise}] {bar:50.cyan/blue} {pos:>7}/{len:7} works files ({eta}) [Memory: {msg}]",
+        "[{elapsed_precise}] {bar:50.cyan/blue} {pos:>7}/{len:7} files | {msg}",
     )?);
+    
+    // Set initial progress message
+    progress.set_message("Starting works processing...");
 
-    // Memory-efficient shared buffers - prioritize frequent flushing over large buffers
-    let works_buffer = Arc::new(Mutex::new(Vec::with_capacity(batch_size)));
-    let locations_buffer = Arc::new(Mutex::new(Vec::with_capacity(batch_size)));
-    let authorships_buffer = Arc::new(Mutex::new(Vec::with_capacity(batch_size * 2)));
-    let topics_buffer = Arc::new(Mutex::new(Vec::with_capacity(batch_size)));
-    let open_access_buffer = Arc::new(Mutex::new(Vec::with_capacity(batch_size)));
-    let citations_buffer = Arc::new(Mutex::new(Vec::with_capacity(batch_size * 3)));
+    // ULTRA-conservative shared buffers for 400GB dataset - prioritize frequent writes over memory
+    let works_buffer = Arc::new(Mutex::new(Vec::with_capacity(batch_size / 8)));       // Even smaller
+    let locations_buffer = Arc::new(Mutex::new(Vec::with_capacity(batch_size / 8)));   // Even smaller
+    let authorships_buffer = Arc::new(Mutex::new(Vec::with_capacity(batch_size / 4))); // Even smaller
+    let topics_buffer = Arc::new(Mutex::new(Vec::with_capacity(batch_size / 8)));      // Even smaller
+    let open_access_buffer = Arc::new(Mutex::new(Vec::with_capacity(batch_size / 8))); // Even smaller
+    let citations_buffer = Arc::new(Mutex::new(Vec::with_capacity(batch_size / 2)));   // Even smaller
 
     let processed_count = Arc::new(AtomicU64::new(0));
 
     info!(
-        "🔥 Processing {} files with ALL {} cores! Let's gooo!",
+        "Processing {} files with {} cores optimized for memory efficiency",
         files_to_process.len(),
         num_cpus::get()
     );
@@ -1833,15 +1840,14 @@ pub fn process_works(
         .try_for_each(|file_path| -> Result<()> {
             let file = File::open(file_path)?;
             let decoder = GzDecoder::new(file);
-            let reader = BufReader::with_capacity(1024 * 1024, decoder); // 1MB buffer per thread
+            let reader = BufReader::with_capacity(256 * 1024, decoder);
 
-            // Smaller local buffers per thread with frequent flushing
-            let mut local_works = Vec::with_capacity(500);
-            let mut local_locations = Vec::with_capacity(1000);
-            let mut local_authorships = Vec::with_capacity(2000);
-            let mut local_topics = Vec::with_capacity(1000);
-            let mut local_open_access = Vec::with_capacity(500);
-            let mut local_citations = Vec::with_capacity(5000);
+            let mut local_works = Vec::with_capacity(50);        
+            let mut local_locations = Vec::with_capacity(100);   
+            let mut local_authorships = Vec::with_capacity(250); 
+            let mut local_topics = Vec::with_capacity(100);      
+            let mut local_open_access = Vec::with_capacity(50);  
+            let mut local_citations = Vec::with_capacity(500);   
             let mut local_processed = 0u64;
 
             for line in reader.lines() {
@@ -1853,7 +1859,7 @@ pub fn process_works(
                 let work: Value = serde_json::from_str(&line)?;
 
                 if let Some(work_id) = work.get("id").and_then(|v| v.as_str()) {
-                    // Process ALL data - no truncation, but be memory conscious
+                    // Process ALL data - preserve full content for research evaluation
                     let title = work
                         .get("title")
                         .and_then(|v| v.as_str())
@@ -1975,7 +1981,7 @@ pub fn process_works(
                                             raw_affiliation_string: authorship
                                                 .get("raw_affiliation_string")
                                                 .and_then(|v| v.as_str())
-                                                .map(|s| s.to_string()), // Keep full affiliation strings
+                                                .map(|s| s.to_string()),
                                         };
                                         local_authorships.push(authorship_record);
                                     } else {
@@ -2014,7 +2020,7 @@ pub fn process_works(
                                         raw_affiliation_string: authorship
                                             .get("raw_affiliation_string")
                                             .and_then(|v| v.as_str())
-                                            .map(|s| s.to_string()),
+                                            .map(|s| s.to_string()), 
                                     };
                                     local_authorships.push(authorship_record);
                                 }
@@ -2071,17 +2077,16 @@ pub fn process_works(
 
                     local_processed += 1;
 
-                    // Aggressive local flushing with much smaller thresholds
-                    flush_local_buffer!(local_works, works_buffer, works_writer, batch_size, works_to_record_batch, 500);
-                    flush_local_buffer!(local_locations, locations_buffer, locations_writer, batch_size, work_locations_to_record_batch, 1000);
-                    flush_local_buffer!(local_authorships, authorships_buffer, authorships_writer, batch_size * 2, authorships_to_record_batch, 2000);
-                    flush_local_buffer!(local_topics, topics_buffer, topics_writer, batch_size, work_topics_to_record_batch, 1000);
-                    flush_local_buffer!(local_open_access, open_access_buffer, open_access_writer, batch_size, work_open_access_to_record_batch, 500);
-                    flush_local_buffer!(local_citations, citations_buffer, citations_writer, batch_size * 3, citations_to_record_batch, 5000);
+                    flush_local_buffer!(local_works, works_buffer, works_writer, batch_size, works_to_record_batch, 50);   // Even smaller
+                    flush_local_buffer!(local_locations, locations_buffer, locations_writer, batch_size, work_locations_to_record_batch, 100);  // Even smaller
+                    flush_local_buffer!(local_authorships, authorships_buffer, authorships_writer, batch_size * 2, authorships_to_record_batch, 250);  // Even smaller
+                    flush_local_buffer!(local_topics, topics_buffer, topics_writer, batch_size, work_topics_to_record_batch, 100);  // Even smaller
+                    flush_local_buffer!(local_open_access, open_access_buffer, open_access_writer, batch_size, work_open_access_to_record_batch, 50);   // Even smaller
+                    flush_local_buffer!(local_citations, citations_buffer, citations_writer, batch_size * 3, citations_to_record_batch, 500);  // Even smaller
 
-                    // Progress reporting and FORCED memory cleanup
-                    if local_processed % 10000 == 0 {
-                        // Force flush ALL local buffers every 10k records to prevent memory buildup
+                    // EMERGENCY memory cleanup every 500 records (MUCH more frequent)
+                    if local_processed % 500 == 0 {
+                        // Force flush ALL local buffers every 500 records to prevent ANY memory buildup
                         flush_local_buffer!(local_works, works_buffer, works_writer, batch_size, works_to_record_batch, 1);
                         flush_local_buffer!(local_locations, locations_buffer, locations_writer, batch_size, work_locations_to_record_batch, 1);
                         flush_local_buffer!(local_authorships, authorships_buffer, authorships_writer, batch_size * 2, authorships_to_record_batch, 1);
@@ -2090,11 +2095,73 @@ pub fn process_works(
                         flush_local_buffer!(local_citations, citations_buffer, citations_writer, batch_size * 3, citations_to_record_batch, 1);
                     }
                     
-                    if local_processed % 50000 == 0 {
-                        let total_processed = processed_count.fetch_add(50000, Ordering::Relaxed) + 50000;
-                        if total_processed % 1_000_000 == 0 {
+                    // Much more frequent progress updates (every 2.5k instead of 5k)
+                    if local_processed % 2500 == 0 {
+                        let total_processed = processed_count.fetch_add(2500, Ordering::Relaxed) + 2500;
+                        
+                        // Update progress much more frequently for better monitoring
+                        if total_processed % 25_000 == 0 { // Update every 25K instead of 50K
                             let memory_info = get_memory_usage();
-                            progress.set_message(format!("{}M works - {}", total_processed / 1_000_000, memory_info));
+                            // Extract just the RSS memory for cleaner display
+                            let rss_info = if memory_info.contains("VmRSS:") {
+                                if let Some(rss_start) = memory_info.find("VmRSS:") {
+                                    let rss_part = &memory_info[rss_start..];
+                                    if let Some(rss_end) = rss_part.find('\n') {
+                                        let rss_line = &rss_part[..rss_end];
+                                        if let Some(kb_str) = rss_line.split_whitespace().nth(1) {
+                                            if let Ok(kb) = kb_str.parse::<u64>() {
+                                                format!("{}GB RAM", kb / 1_000_000)
+                                            } else {
+                                                "RAM: unknown".to_string()
+                                            }
+                                        } else {
+                                            "RAM: unknown".to_string()
+                                        }
+                                    } else {
+                                        "RAM: unknown".to_string()
+                                    }
+                                } else {
+                                    "RAM: unknown".to_string()
+                                }
+                            } else {
+                                "RAM: unknown".to_string()
+                            };
+                            
+                            progress.set_message(format!("{}M works processed | {}", 
+                                total_processed / 1_000_000, rss_info));
+                        }
+                    }
+
+                    // CRITICAL: Memory pressure relief system for 400GB dataset
+                    if local_processed % 1000 == 0 { // Check more frequently
+                        // Check memory usage and force global flush if needed
+                        let memory_info = get_memory_usage();
+                        if memory_info.contains("VmRSS:") {
+                            // Extract RSS memory in kB
+                            if let Some(rss_start) = memory_info.find("VmRSS:") {
+                                if let Some(rss_str) = memory_info[rss_start..].split_whitespace().nth(1) {
+                                    if let Ok(rss_kb) = rss_str.parse::<u64>() {
+                                        // Much more aggressive: If using more than 30GB RSS, force emergency flush
+                                        if rss_kb > 30_000_000 {
+                                            // EMERGENCY: Force flush ALL buffers immediately
+                                            flush_local_buffer!(local_works, works_buffer, works_writer, batch_size, works_to_record_batch, 1);
+                                            flush_local_buffer!(local_locations, locations_buffer, locations_writer, batch_size, work_locations_to_record_batch, 1);
+                                            flush_local_buffer!(local_authorships, authorships_buffer, authorships_writer, batch_size * 2, authorships_to_record_batch, 1);
+                                            flush_local_buffer!(local_topics, topics_buffer, topics_writer, batch_size, work_topics_to_record_batch, 1);
+                                            flush_local_buffer!(local_open_access, open_access_buffer, open_access_writer, batch_size, work_open_access_to_record_batch, 1);
+                                            flush_local_buffer!(local_citations, citations_buffer, citations_writer, batch_size * 3, citations_to_record_batch, 1);
+                                            
+                                            // Clear all local buffers to minimum capacity
+                                            local_works.shrink_to_fit();
+                                            local_locations.shrink_to_fit();
+                                            local_authorships.shrink_to_fit();
+                                            local_topics.shrink_to_fit();
+                                            local_open_access.shrink_to_fit();
+                                            local_citations.shrink_to_fit();
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
 
@@ -2112,6 +2179,43 @@ pub fn process_works(
 
             progress.inc(1);
             stats.files_processed.fetch_add(1, Ordering::Relaxed);
+            
+            // Show file progress for better monitoring with more frequent updates
+            let files_done = stats.files_processed.load(Ordering::Relaxed);
+            if files_done % 5 == 0 || files_done == 1 { // Update every 5 files or on first file
+                let memory_info = get_memory_usage();
+                // Extract RSS memory for cleaner display
+                let rss_gb = if memory_info.contains("VmRSS:") {
+                    if let Some(rss_start) = memory_info.find("VmRSS:") {
+                        let rss_part = &memory_info[rss_start..];
+                        if let Some(rss_end) = rss_part.find('\n') {
+                            let rss_line = &rss_part[..rss_end];
+                            if let Some(kb_str) = rss_line.split_whitespace().nth(1) {
+                                if let Ok(kb) = kb_str.parse::<u64>() {
+                                    format!("{}GB", kb / 1_000_000)
+                                } else {
+                                    "?GB".to_string()
+                                }
+                            } else {
+                                "?GB".to_string()
+                            }
+                        } else {
+                            "?GB".to_string()
+                        }
+                    } else {
+                        "?GB".to_string()
+                    }
+                } else {
+                    "?GB".to_string()
+                };
+                
+                let works_processed = stats.works_processed.load(Ordering::Relaxed);
+                progress.set_message(format!("File {}/{} | {}M works | {} RAM", 
+                    files_done, files_to_process.len(), works_processed / 1_000_000, rss_gb));
+                    
+                info!("Processing file {}/{} - {}M works total - {} RAM", 
+                    files_done, files_to_process.len(), works_processed / 1_000_000, rss_gb);
+            }
 
             Ok(())
         })?;
@@ -2164,7 +2268,7 @@ pub fn process_works(
     progress.finish_with_message("Works processing complete");
 
     let works_count = stats.works_processed.load(Ordering::Relaxed);
-    info!("🔥 Processed {} works using ALL {} cores!", works_count, num_cpus::get());
+    info!("Processed {} works using {} cores!", works_count, num_cpus::get());
 
     Ok(())
 }
@@ -2176,15 +2280,20 @@ async fn main() -> Result<()> {
 
     let args = Cli::parse();
 
-    // Set up thread pool
-    let num_workers = args.workers.unwrap_or_else(|| num_cpus::get());
+    // Set up thread pool - be VERY conservative for 400GB dataset memory management
+    let max_workers = num_cpus::get();
+    // For works processing, use even fewer threads to prevent memory explosion
+    let conservative_workers = std::cmp::min(max_workers, 32); // Cap at 32 threads for 400GB dataset
+    let num_workers = args.workers.unwrap_or(conservative_workers);
 
-    info!("Starting OpenAlex Academic Data Processor with {} workers", num_workers);
+    warn!("ULTRA-MEMORY-CONSERVATIVE MODE: Using {} workers (max available: {})", num_workers, max_workers);
+    warn!("For 400GB dataset processing with MAXIMUM memory conservation");
+    warn!("All research data will be preserved without truncation");
     info!("Batch size: {} records per batch", args.batch_size);
 
     rayon::ThreadPoolBuilder::new()
         .num_threads(num_workers)
-        .stack_size(16 * 1024 * 1024) // 16MB stack per thread
+        .stack_size(8 * 1024 * 1024) // 8MB stack per thread 
         .thread_name(|i| format!("openalex-worker-{}", i))
         .build_global()?;
 
