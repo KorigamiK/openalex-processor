@@ -283,14 +283,12 @@ fn get_memory_usage() -> String {
 fn get_memory_gb() -> String {
     let memory_info = get_memory_usage();
     if memory_info.contains("VmRSS:") {
-        if let Some(rss_start) = memory_info.find("VmRSS:") {
-            let rss_part = &memory_info[rss_start..];
-            if let Some(rss_end) = rss_part.find('\n') {
-                let rss_line = &rss_part[..rss_end];
-                if let Some(kb_str) = rss_line.split_whitespace().nth(1) {
-                    if let Ok(kb) = kb_str.parse::<u64>() {
-                        return format!("{:.1}GB", kb as f64 / 1_000_000.0);
-                    }
+        // Split the line and look for the number
+        let parts: Vec<&str> = memory_info.split_whitespace().collect();
+        for (i, part) in parts.iter().enumerate() {
+            if part == &"VmRSS:" && i + 1 < parts.len() {
+                if let Ok(kb) = parts[i + 1].parse::<u64>() {
+                    return format!("{:.1}GB", kb as f64 / 1_000_000.0);
                 }
             }
         }
